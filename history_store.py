@@ -1,0 +1,365 @@
+"""SQLite history and forecast persistence for the onion Chronos-2 MVP.
+
+Canonical observation units in SQLite:
+- prices: INR per metric quintal (₹/metric quintal)
+- arrivals: metric quintals per observation/day
+- production and consumption: metric quintals/day
+Forecast prices are persisted separately in INR/kg, as requested.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
+DEFAULT_CSV = ROOT / "data" / "Onion_Model_Ready_Dataset_Chronos2_2026-10-26_Interpolated_Metric_Quintal.csv"
+STATE_CODES = ("AP", "KA", "MH", "MP")
+STATE_NAMES = {"AP": "Andhra Pradesh", "KA": "Karnataka", "MH": "Maharashtra", "MP": "Madhya Pradesh"}
+
+PRICE_COLUMNS = {
+    state: {
+        "retail": f"{state}_retail_rs_per_metric_quintal",
+        "wholesale": f"{state}_wholesale_rs_per_metric_quintal",
+        "mandi_modal": f"{state}_mandi_modal_rs_per_metric_quintal",
+    } for state in STATE_CODES
+}
+QUANTITY_COLUMNS = {
+    state: {
+        "arrival": f"{state}_arrival_metric_quintal",
+        "production": f"{state}_production_metric_quintal_per_day",
+        "consumption": f"{state}_consumption_metric_quintal_per_day",
+    } for state in STATE_CODES
+}
+SUPPLY_COLUMNS = {state: f"{state}_supply_metric_quintal_per_day" for state in STATE_CODES}
+EXPECTED_COLUMNS = ["item_id", "timestamp"]
+for _state in STATE_CODES:
+    EXPECTED_COLUMNS.extend(PRICE_COLUMNS[_state][m] for m in ("retail", "wholesale", "mandi_modal"))
+    EXPECTED_COLUMNS.extend(QUANTITY_COLUMNS[_state][m] for m in ("arrival", "production", "consumption"))
+NUMERIC_COLUMNS = [c for c in EXPECTED_COLUMNS if c not in ("item_id", "timestamp")]
+
+
+def _resolve_path(env_name: str, fallback: Path) -> Path:
+    raw = os.getenv(env_name)
+    if not raw:
+        return fallback
+    p = Path(raw).expanduser()
+    return p if p.is_absolute() else (ROOT / p).resolve()
+
+CSV_PATH = _resolve_path("ONION_DATA_PATH", DEFAULT_CSV)
+DB_PATH = _resolve_path("ONION_DB_PATH", ROOT / "data" / "onion_forecasting_v4.sqlite3")
+
+
+@dataclass
+class SyncResult:
+    source: str
+    rows_seen: int
+    inserted: int
+    updated: int
+    unchanged: int
+    latest_observation_date: str | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"source": self.source, "rows_seen": self.rows_seen, "inserted": self.inserted,
+                "updated": self.updated, "unchanged": self.unchanged,
+                "latest_observation_date": self.latest_observation_date}
+
+
+def connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
+    existing = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='observations'").fetchone()
+    if existing:
+        cols = {r[1] for r in conn.execute('PRAGMA table_info("observations")').fetchall()}
+        if not set(EXPECTED_COLUMNS).issubset(cols):
+            legacy_name = "observations_legacy_previous"
+            legacy_exists = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (legacy_name,)).fetchone()
+            if not legacy_exists:
+                conn.execute(f'ALTER TABLE observations RENAME TO "{legacy_name}"')
+            else:
+                conn.execute("DROP TABLE observations")
+    cols_sql = ['"timestamp" TEXT PRIMARY KEY', '"item_id" TEXT NOT NULL',
+                *[f'"{c}" REAL NOT NULL' for c in NUMERIC_COLUMNS],
+                '"source" TEXT NOT NULL', '"ingested_at" TEXT NOT NULL']
+    conn.execute(f"CREATE TABLE IF NOT EXISTS observations ({', '.join(cols_sql)})")
+    conn.execute("""CREATE TABLE IF NOT EXISTS ingestion_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, checked_at TEXT NOT NULL, source TEXT NOT NULL,
+        status TEXT NOT NULL, rows_seen INTEGER NOT NULL DEFAULT 0, inserted INTEGER NOT NULL DEFAULT 0,
+        updated INTEGER NOT NULL DEFAULT 0, unchanged INTEGER NOT NULL DEFAULT 0,
+        latest_observation_date TEXT, message TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS source_sync_state (
+        source_path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, synced_at TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS forecast_runs (
+        run_id INTEGER PRIMARY KEY AUTOINCREMENT, graph_code TEXT NOT NULL, generated_at TEXT NOT NULL,
+        model_id TEXT NOT NULL, horizon_days INTEGER NOT NULL, last_observation_date TEXT NOT NULL,
+        context_hash TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}')""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_forecast_runs_graph_latest ON forecast_runs(graph_code, generated_at DESC)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS forecast_values (
+        run_id INTEGER NOT NULL, state_code TEXT NOT NULL, target_key TEXT NOT NULL,
+        forecast_date TEXT NOT NULL, p10 REAL NOT NULL, p50 REAL NOT NULL, p90 REAL NOT NULL,
+        unit TEXT NOT NULL, PRIMARY KEY (run_id,state_code,target_key,forecast_date),
+        FOREIGN KEY (run_id) REFERENCES forecast_runs(run_id) ON DELETE CASCADE)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_forecast_values_latest ON forecast_values(state_code,target_key,forecast_date)")
+
+
+def _canonicalize_source_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    src = frame.copy()
+    src.columns = [str(c).replace("\ufeff", "").strip() for c in src.columns]
+    rename = {}
+    for state in STATE_CODES:
+        # Price column alternatives, including the older MVP's INR/kg columns.
+        for measure in ("retail", "wholesale", "mandi_modal"):
+            target = PRICE_COLUMNS[state][measure]
+            alternatives = [
+                target,
+                f"{state}_{measure}_rs_per_metric_quintal",
+                f"{state}_{measure}_rs_kg",
+                f"{state}_{measure}_rs_kg" if measure != "mandi_modal" else f"{state}_mandi_modal_rs_kg",
+            ]
+            for candidate in alternatives:
+                if candidate in src.columns:
+                    rename[candidate] = target
+                    break
+        # Quantity alternatives.
+        quantity_alts = {
+            "arrival": [QUANTITY_COLUMNS[state]["arrival"], f"{state}_arrival_mq", f"{state}_arrival_t"],
+            "production": [QUANTITY_COLUMNS[state]["production"], f"{state}_production_mq_day", f"{state}_production_t_day"],
+            "consumption": [QUANTITY_COLUMNS[state]["consumption"], f"{state}_consumption_mq_day", f"{state}_consumption_t_day"],
+        }
+        for measure, candidates in quantity_alts.items():
+            for candidate in candidates:
+                if candidate in src.columns:
+                    rename[candidate] = QUANTITY_COLUMNS[state][measure]
+                    break
+    src = src.rename(columns=rename)
+    return src
+
+
+def normalize_source_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize schema to DB's canonical columns and units (prices ₹/metric quintal).
+
+    The cleaned standardized file already uses ₹/metric quintal and metric quintals.
+    Legacy *_rs_kg prices are multiplied by 100; legacy tonne quantities are multiplied
+    by 10. Unit conversions are only done when the input column name indicates the old unit.
+    """
+    original = frame.copy()
+    original.columns = [str(c).replace("\ufeff", "").strip() for c in original.columns]
+    src = _canonicalize_source_columns(original)
+    if "timestamp" not in src.columns:
+        raise ValueError("Dataset must include a 'timestamp' date column.")
+    out = pd.DataFrame()
+    out["timestamp"] = pd.to_datetime(src["timestamp"], errors="coerce")
+    if out["timestamp"].isna().any():
+        raise ValueError("Input contains invalid or blank timestamps.")
+    out["timestamp"] = out["timestamp"].dt.normalize()
+    out["item_id"] = src["item_id"].astype(str) if "item_id" in src.columns else "AP_onion"
+
+    for state in STATE_CODES:
+        for measure in ("retail", "wholesale", "mandi_modal"):
+            canonical = PRICE_COLUMNS[state][measure]
+            if canonical not in src.columns:
+                raise ValueError(f"Missing price column for {state} {measure}: expected {canonical}.")
+            vals = pd.to_numeric(src[canonical], errors="coerce")
+            # If source was the legacy model-ready file, its old name means ₹/kg.
+            old_name = f"{state}_{measure}_rs_kg"
+            if measure == "mandi_modal":
+                old_name = f"{state}_mandi_modal_rs_kg"
+            if old_name in original.columns and canonical not in original.columns:
+                vals = vals * 100.0
+            out[canonical] = vals
+        for measure in ("arrival", "production", "consumption"):
+            canonical = QUANTITY_COLUMNS[state][measure]
+            if canonical not in src.columns:
+                raise ValueError(f"Missing quantity column for {state} {measure}: expected {canonical}.")
+            vals = pd.to_numeric(src[canonical], errors="coerce")
+            legacy = f"{state}_{measure}_t" if measure == "arrival" else f"{state}_{measure}_t_day"
+            if legacy in original.columns and canonical not in original.columns:
+                vals = vals * 10.0
+            out[canonical] = vals
+
+    out = out[EXPECTED_COLUMNS]
+    if out["timestamp"].duplicated().any():
+        dates = out.loc[out["timestamp"].duplicated(keep=False), "timestamp"].dt.strftime("%Y-%m-%d").head(4).tolist()
+        raise ValueError(f"Input contains duplicate dates, e.g. {dates}.")
+    for col in NUMERIC_COLUMNS:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    bad = [c for c in NUMERIC_COLUMNS if out[c].isna().any() or not np.isfinite(out[c].to_numpy(dtype=float)).all()]
+    if bad:
+        raise ValueError("Input has missing/non-numeric/non-finite values in: " + ", ".join(bad))
+    if out["item_id"].nunique() != 1:
+        raise ValueError("Combined dataset must contain one item_id and one aligned row per date.")
+    out["item_id"] = out["item_id"].astype(str)
+    out = out.sort_values("timestamp").reset_index(drop=True)
+    expected = pd.date_range(out["timestamp"].min(), out["timestamp"].max(), freq="D")
+    if not pd.DatetimeIndex(out["timestamp"]).equals(expected):
+        raise ValueError("Dataset must have a continuous daily date index.")
+    return out
+
+
+def _log_sync(conn: sqlite3.Connection, result: SyncResult, status: str = "success", message: str | None = None) -> None:
+    checked = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute("""INSERT INTO ingestion_log
+        (checked_at,source,status,rows_seen,inserted,updated,unchanged,latest_observation_date,message)
+        VALUES (?,?,?,?,?,?,?,?,?)""", (checked, result.source, status, result.rows_seen, result.inserted,
+        result.updated, result.unchanged, result.latest_observation_date, message))
+
+
+def upsert_frame(frame: pd.DataFrame, source: str = "model_ready_csv") -> SyncResult:
+    out = normalize_source_frame(frame)
+    inserted = updated = unchanged = 0
+    ingested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    insert_columns = ["timestamp", "item_id", *NUMERIC_COLUMNS, "source", "ingested_at"]
+    placeholders = ",".join("?" for _ in insert_columns)
+    update_cols = ["item_id", *NUMERIC_COLUMNS, "source", "ingested_at"]
+    update_sql = ",".join(f'"{c}"=excluded."{c}"' for c in update_cols)
+    quoted_insert = ",".join(f'"{c}"' for c in insert_columns)
+    compare_cols = ["item_id", *NUMERIC_COLUMNS]
+    quoted_compare = ",".join(f'"{c}"' for c in compare_cols)
+    sql = f'INSERT INTO observations ({quoted_insert}) VALUES ({placeholders}) ON CONFLICT(timestamp) DO UPDATE SET {update_sql}'
+    with connect() as conn:
+        _create_schema(conn)
+        try:
+            for _, row in out.iterrows():
+                stamp = row["timestamp"].strftime("%Y-%m-%d")
+                values = (stamp, str(row["item_id"]), *[float(row[c]) for c in NUMERIC_COLUMNS], source, ingested_at)
+                existing = conn.execute(f'SELECT {quoted_compare} FROM observations WHERE timestamp=?', (stamp,)).fetchone()
+                if existing is None:
+                    inserted += 1
+                    conn.execute(sql, values)
+                else:
+                    new_cmp = values[1:2 + len(NUMERIC_COLUMNS)]
+                    old_cmp = tuple(existing[c] for c in compare_cols)
+                    if new_cmp[0] == old_cmp[0] and all(abs(float(a)-float(b)) < 1e-9 for a,b in zip(new_cmp[1:], old_cmp[1:])):
+                        unchanged += 1
+                    else:
+                        updated += 1
+                        conn.execute(sql, values)
+            latest = out["timestamp"].max().strftime("%Y-%m-%d") if not out.empty else None
+            result = SyncResult(source, len(out), inserted, updated, unchanged, latest)
+            _log_sync(conn, result)
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            failed = SyncResult(source, len(out), inserted, updated, unchanged,
+                                out["timestamp"].max().strftime("%Y-%m-%d") if not out.empty else None)
+            _log_sync(conn, failed, status="error", message=str(exc))
+            conn.commit()
+            raise
+    return result
+
+
+def _mark_source_synced(path: Path) -> None:
+    stat = path.stat()
+    with connect() as conn:
+        _create_schema(conn)
+        conn.execute("""INSERT INTO source_sync_state(source_path,mtime_ns,synced_at) VALUES(?,?,?)
+            ON CONFLICT(source_path) DO UPDATE SET mtime_ns=excluded.mtime_ns,synced_at=excluded.synced_at""",
+            (str(path.resolve()), int(stat.st_mtime_ns), datetime.now(timezone.utc).isoformat(timespec="seconds")))
+
+
+def sync_model_ready_csv(path: str | Path, source: str = "model_ready_csv") -> SyncResult:
+    path = Path(path).expanduser()
+    if not path.is_absolute():
+        path = (ROOT / path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"CSV file not found: {path}")
+    frame = pd.read_csv(path, encoding="utf-8-sig")
+    result = upsert_frame(frame, source=source)
+    if path.resolve() == CSV_PATH.resolve():
+        _mark_source_synced(path)
+    return result
+
+
+def ensure_store_ready() -> None:
+    with connect() as conn:
+        _create_schema(conn)
+        count = int(conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()["n"])
+        state = conn.execute("SELECT mtime_ns FROM source_sync_state WHERE source_path=?", (str(CSV_PATH.resolve()),)).fetchone()
+    if not CSV_PATH.exists():
+        if count == 0:
+            raise FileNotFoundError(f"No history rows and seed CSV missing at {CSV_PATH}.")
+        return
+    csv_mtime = CSV_PATH.stat().st_mtime_ns
+    if count == 0 or state is None or int(state["mtime_ns"]) != int(csv_mtime):
+        result = sync_model_ready_csv(CSV_PATH, source="initial_csv_seed" if count == 0 else "configured_csv_refresh")
+        print(f"Synchronized configured dataset into SQLite: {result.as_dict()}")
+
+
+def load_history() -> pd.DataFrame:
+    ensure_store_ready()
+    quoted = ",".join(f'"{c}"' for c in EXPECTED_COLUMNS)
+    with connect() as conn:
+        frame = pd.read_sql_query(f"SELECT {quoted} FROM observations ORDER BY timestamp", conn)
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+    for state in STATE_CODES:
+        frame[SUPPLY_COLUMNS[state]] = frame[QUANTITY_COLUMNS[state]["arrival"]] + frame[QUANTITY_COLUMNS[state]["production"]]
+    return frame
+
+
+def save_forecast_run(graph_code: str, horizon_days: int, last_observation_date: str, context_hash: str,
+                      forecast_values: Iterable[dict[str, Any]], model_id: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    values = list(forecast_values)
+    with connect() as conn:
+        _create_schema(conn)
+        cur = conn.execute("""INSERT INTO forecast_runs(graph_code,generated_at,model_id,horizon_days,last_observation_date,context_hash,metadata_json)
+            VALUES(?,?,?,?,?,?,?)""", (graph_code, generated_at, model_id, int(horizon_days), last_observation_date,
+            context_hash, json.dumps(metadata or {}, ensure_ascii=False, default=str)))
+        run_id = int(cur.lastrowid)
+        conn.executemany("""INSERT INTO forecast_values(run_id,state_code,target_key,forecast_date,p10,p50,p90,unit)
+            VALUES(?,?,?,?,?,?,?,?)""", [(run_id, str(v["state_code"]), str(v["target_key"]), str(v["forecast_date"]),
+            float(v["p10"]), float(v["p50"]), float(v["p90"]), str(v["unit"])) for v in values])
+        conn.commit()
+    return {"run_id": run_id, "generated_at": generated_at, "saved_values": len(values), "graph_code": graph_code}
+
+
+def get_latest_forecast(graph_code: str | None = None) -> dict[str, Any] | None:
+    ensure_store_ready()
+    with connect() as conn:
+        if graph_code:
+            row = conn.execute("SELECT * FROM forecast_runs WHERE graph_code=? ORDER BY generated_at DESC,run_id DESC LIMIT 1", (graph_code,)).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM forecast_runs ORDER BY generated_at DESC,run_id DESC LIMIT 1").fetchone()
+        if row is None:
+            return None
+        values = conn.execute("SELECT state_code,target_key,forecast_date,p10,p50,p90,unit FROM forecast_values WHERE run_id=? ORDER BY state_code,target_key,forecast_date", (row["run_id"],)).fetchall()
+    result = dict(row)
+    result["metadata"] = json.loads(result.pop("metadata_json") or "{}")
+    result["forecast_values"] = [dict(v) for v in values]
+    return result
+
+
+def list_forecast_runs(limit: int = 20) -> list[dict[str, Any]]:
+    ensure_store_ready()
+    with connect() as conn:
+        rows = conn.execute("SELECT run_id,graph_code,generated_at,model_id,horizon_days,last_observation_date,context_hash FROM forecast_runs ORDER BY generated_at DESC,run_id DESC LIMIT ?", (max(1,min(int(limit),100)),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def ingestion_status() -> dict[str, Any]:
+    ensure_store_ready()
+    with connect() as conn:
+        latest_log = conn.execute("SELECT * FROM ingestion_log ORDER BY id DESC LIMIT 1").fetchone()
+        count = conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()["n"]
+        dates = conn.execute("SELECT MIN(timestamp) AS first_date,MAX(timestamp) AS last_date FROM observations").fetchone()
+        runs = conn.execute("SELECT COUNT(*) AS n FROM forecast_runs").fetchone()["n"]
+    return {"database_path": str(DB_PATH), "observation_rows": int(count),
+            "first_observation_date": dates["first_date"], "last_observation_date": dates["last_date"],
+            "forecast_run_count": int(runs), "last_ingestion": dict(latest_log) if latest_log else None}
